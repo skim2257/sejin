@@ -1,11 +1,38 @@
 import sys
 import warnings
+import traceback
+import gc
+import glob
+import os
+
+import torch
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
 
 def seven(txt):
     txt = str(txt)
     while(len(txt) < 7):
         txt = "0" + txt
     return txt
+
+def find_batch_size(model, input_size):
+    model = model.to(device)
+    for i in torch.logspace(8, 0, 9, base=2, dtype=int):
+        # print(torch.cuda.memory_summary(device=None, abbreviated=False))
+        try:
+            x = torch.zeros((i, *input_size)).to(device)
+            y = model(x)
+            print(y.shape)
+            print(f"Batch size {i} fit!")
+            return i
+        except Exception as e:
+            print(f"Batch size {i} doesn't fit with error:", e)
+            print(traceback.format_exc())
+        finally:
+            del x
+        
+        gc.collect()
+        
 
 def model_summary(model, file=sys.stderr):
     def repr(model):
@@ -47,5 +74,16 @@ def model_summary(model, file=sys.stderr):
         print(string, file=file)
     return count
 
+def crawler(path):
+    series_folders = []
+    for n, (path, directories, files) in enumerate(os.walk(path)):
+    #     print (f'ls {path}')
+    # #     for directory in directories:
+    # #         print(f"\td{directory}")
+        if len(glob.glob(os.path.join(path, "*.dcm"))) > 2:
+            series_folders.append(path)
+    #     if n > 5:
+    #         break
 
+    print(len(series_folders))
     
