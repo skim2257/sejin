@@ -4,7 +4,9 @@ import traceback
 import gc
 import glob
 import os
+from sklearn.metrics import accuracy_score, roc_auc_score, precision_recall_curve, auc
 
+import numpy as np
 import torch
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
@@ -86,4 +88,17 @@ def crawler(path):
     #         break
 
     print(len(series_folders))
+
+def metrics(y_true, y_hat, stage=""):
+    assert y_true.shape == y_hat.shape, f"y_true and y_hat do not match shapes: {y_true.shape} vs {y_hat.shape}"
+
+    binarize = np.vectorize(lambda x: 1 if x > 0.5 else 0)
+    acc = accuracy_score(y_true, binarize(y_hat))
+    auroc = roc_auc_score(y_true, y_hat)
+    pre, rec, _ = precision_recall_curve(y_true, y_hat)
+    auprc = auc(rec, pre)
     
+    if stage is not "":
+        stage += "_"
+    
+    return acc, auroc, auprc

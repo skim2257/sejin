@@ -11,14 +11,14 @@ from sklearn.svm import SVC, SVR
 from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans, SpectralClustering, AffinityPropagation
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.feature_selection import SelectFromModel, SelectKBest, SelectPercentile, chi2
+from sklearn.feature_selection import SelectFromModel, SelectKBest, SelectPercentile, chi2, f_classif
 from sklearn.metrics import get_scorer
 
 import numpy as np
 import pandas as pd
 # import pickle
 import json
-import os
+import os, warnings
 
 from joblib import dump, load
 
@@ -235,13 +235,6 @@ class AutoML():
         else:
             raise NotImplementedError   
 
-    def report(self):
-        # add bootstrapping
-        pass
-
-    def features(self):
-        pass
-    
     def get_nparams(self,
                     hparams: dict):
 
@@ -258,6 +251,10 @@ class AutoML():
         
         return n
 
+    def tune_hparams(self, model, hparams, kwargs, X, y):
+        model = self.get_model(model, hparams, kwargs)
+        return model.fit(X, y)
+    
     def get_model(self, model, hparams, kwargs):
         if 'halvinggrid' in self.search:
             return HalvingGridSearchCV(model,
@@ -265,21 +262,21 @@ class AutoML():
                                        factor=2,
                                        scoring=self.metrics[-1],
                                        cv=self.cv,
-                                       error_score=0.).fit(X_train, y_train)
+                                       error_score=0.)
         elif 'grid' in self.search:
             return GridSearchCV(model, 
                                 hparams, 
-                                **kwargs).fit(X_train, y_train)
+                                **kwargs)
         elif 'random' in self.search:
             return RandomizedSearchCV(model, 
                                       hparams, 
-                                      n_iter=n_iter,
-                                      **kwargs).fit(X_train, y_train)
+                                      **kwargs)
         
-
     def fit(self, X, y, 
             test_size: float = 0.2,
-            n_iter: int = 25):
+            n_iter: int = 25,
+            normalize: bool = True,
+            test: bool = True):
         """
         params
         ------
@@ -293,37 +290,50 @@ class AutoML():
         assert X.ndim == 2
 
         # TO-DO: use ColumnTransformer to handle numerical vs categorical >> integrate into Pipeline()
-        X, y = self.normalize(X, y, method='standard') 
-        print(y)
+        if normalize:
+            print("Normalizing model with StandardScaler")
+            X_train, y_train = self.normalize(X, y, method='standard') 
 
         # train/test split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=y, random_state=1129)
-        print(f"Event rates: {y_train.sum()/len(y_train):.3f} (train) {y_test.sum()/len(y_test):.3f} (test)")
-        print(f"Train/test: {len(y_train)}/{len(y_test)}")
+        if test:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=y, random_state=1129)
+            print(f"Event rates: {y_train.sum()/len(y_train):.3f} (train) {y_test.sum()/len(y_test):.3f} (test)")
+            print(f"Train/test: {len(y_train)}/{len(y_test)}")
+        else:
+            X_train, y_train = X, y
+            print(f"Event rates: {y_train.sum()/len(y_train):.3f}")
+            print(f"n = {len(y_train)}")
         
         # feature selection
         if self.feature_selection == 'lasso' or self.feature_selection == 'l1':
             lasso = LogisticRegression(C=1e-1, penalty='l1', solver='saga').fit(X_train, y_train)
             fs = SelectFromModel(lasso, prefit=True)
         elif self.feature_selection == 'kbest':
-            fs = SelectKBest(chi2, k=10).fit(X_train, y_train)
+            fs = SelectKBest(f_classif, k=10).fit(X_train, y_train)
         elif 'percent' in self.feature_selection:
-            fs = SelectPercentile(chi2, percentile=20).fit(X_train, y_train)
+            fs = SelectPercentile(f_classif, percentile=20).fit(X_train, y_train)
         elif 'rfe' in self.feature_selection or 'recursive' in self.feature_selection:
-            raise NotImplementedError()
+            raise NotImplementedError
 
         if self.feature_selection != 'none':
+            print("original:", X_train.shape)
             X_train = fs.transform(X_train)
-            X_test = fs.transform(X_test)
+            if test:
+                X_test = fs.transform(X_test)
+            print("transformed:", X_train.shape)
 
         # initialize saving best_models, best_params
-        self.best_models, self.best_params, self.scores, self.auroc = {}, {}, {}, {}
+        self.best_models, self.best_params, self.scores, self.auroc, self.cv_results = {}, {}, {}, {}, {}
         
         kwargs = {'scoring': self.metrics, 
                   'n_jobs': -1, 
                   'cv': self.cv, 
                   'refit': self.metrics[-1], 
-                  'error_score': 0.}
+                  'error_score': 0.,
+                  'return_train_score': True}
+        
+        if 'random' in self.search:
+            kwargs['n_iter'] = n_iter
 
         for k in self.models:
             model = self.models[k]
@@ -334,9 +344,9 @@ class AutoML():
             
             # perform hparam search
             print(f"\nIterating search through {n_params} hyperparameters for {k}.")
-            clf = self.tune_hparams(model, hparams, kwargs)
+            clf = self.tune_hparams(model, hparams, kwargs, X_train, y_train)
             
-            
+            self.cv_results[k] = clf.cv_results_
             self.best_models[k] = clone(clf.best_estimator_)
             # self.best_params[k] = clf.best_params_
 
@@ -349,7 +359,10 @@ class AutoML():
                 # y_train_hat = clf.predict(X_train)
                 # print(clf.scorer_[metric])
                 train_score = clf.scorer_[metric](clf, X_train, y_train)
-                test_score  = clf.scorer_[metric](clf, X_test, y_test)
+                if test:
+                    test_score = clf.scorer_[metric](clf, X_test, y_test)
+                else:
+                    test_score = train_score
                 self.scores[k][metric] = test_score
                 if "roc_auc" == metric:
                     self.auroc[k] = test_score
@@ -361,11 +374,19 @@ class AutoML():
         self.fitted_models = {}
         for k in self.best_models:
             self.fitted_models[k] = self.best_models[k].fit(X, y)
+            
             print(f"Training {k} on entire dataset yields AUROC: {get_scorer('roc_auc')(self.fitted_models[k], X, y):.3f}")
             if self.save_dir is not None:
                 dump(self.fitted_models[k], os.path.join(self.save_dir, f"{k}.pkl")) 
         
-        best_idx = np.argmax(list(self.auroc.values()))
+        # if no validation/test set, override self.auroc with cv_results
+        if not test: 
+            for k in self.cv_results:
+                results = self.cv_results[k]
+                best_idx = np.argmin(results['rank_test_roc_auc'])
+                self.auroc[k] = results["mean_test_roc_auc"][best_idx]
+
+        best_idx = np.argmax(list(self.auroc.values()))            
         model_k = list(self.auroc.keys())[best_idx]
         self.best_model = self.best_models[model_k]
         print(f"\n\nBest model: {self.best_model} with AUROC {self.auroc[model_k]:.4f}")
@@ -374,7 +395,22 @@ class AutoML():
         return
     
     def predict(self, X):
+        """
+        Returns probability of each class for each sample
+        """
         return self.best_model.predict_proba(X)
     
+    def infer(self, X):
+        """
+        Returns final prediction for each sample
+        """
+        return self.best_model.predict(X)
+
     def score(self, X, y):
         return self.best_model.score(X, y)
+
+    def report(self):
+        raise NotImplementedError
+
+    def features(self):
+        raise NotImplementedError
